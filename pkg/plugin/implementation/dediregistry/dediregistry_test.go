@@ -846,3 +846,152 @@ func TestDeDiRegistryClient_Lookup_Cache(t *testing.T) {
 		}
 	})
 }
+
+func dediNodeResponse(ttl float64) map[string]interface{} {
+	resp := map[string]interface{}{
+		"message": "ok",
+		"data": map[string]interface{}{
+			"details": map[string]interface{}{
+				"url":           "http://bpp.example.com",
+				"type":          "BPP",
+				"domain":        "energy",
+				"subscriber_id": "bpp.example.com",
+				// signing_public_key intentionally absent — LookupNode sets requireSigningKey=false
+			},
+			"meta": map[string]interface{}{
+				"manifestUrl": "https://bpp.example.com/manifest.json",
+			},
+			"created_at": "2025-01-01T00:00:00Z",
+			"updated_at": "2025-01-01T00:00:00Z",
+		},
+	}
+	if ttl > 0 {
+		resp["data"].(map[string]interface{})["ttl"] = ttl
+	}
+	return resp
+}
+
+func TestDeDiRegistryClient_LookupNode_Cache(t *testing.T) {
+	ctx := context.Background()
+	nodeID := "nfh.global/subscribers.beckn.one/bpp.example.com"
+	expectedCacheKey := "lookup_node_nfh.global/subscribers.beckn.one/bpp.example.com"
+
+	t.Run("cache hit skips HTTP call", func(t *testing.T) {
+		cachedRecord := model.SubscriberRecord{
+			Subscription: model.Subscription{
+				Subscriber: model.Subscriber{URL: "http://bpp.example.com"},
+			},
+			Meta: map[string]string{"manifestUrl": "cached-manifest"},
+		}
+		cachedJSON, _ := json.Marshal(cachedRecord)
+
+		httpCalled := false
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			httpCalled = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		cache := &mockCache{
+			getFunc: func(ctx context.Context, key string) (string, error) {
+				return string(cachedJSON), nil
+			},
+		}
+		client, closer, err := New(ctx, cache, &Config{URL: server.URL})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer closer()
+
+		record, err := client.LookupNode(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("LookupNode() unexpected error: %v", err)
+		}
+		if httpCalled {
+			t.Error("expected HTTP call to be skipped on cache hit")
+		}
+		if record.Meta["manifestUrl"] != "cached-manifest" {
+			t.Errorf("expected cached record, got %+v", record)
+		}
+	})
+
+	t.Run("cache miss writes to cache using ttl from response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(dediNodeResponse(300))
+		}))
+		defer server.Close()
+
+		cache := &mockCache{}
+		client, closer, err := New(ctx, cache, &Config{URL: server.URL})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer closer()
+
+		record, err := client.LookupNode(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("LookupNode() unexpected error: %v", err)
+		}
+		if record.URL != "http://bpp.example.com" {
+			t.Errorf("unexpected subscriber URL: %s", record.URL)
+		}
+		if record.Meta["manifestUrl"] != "https://bpp.example.com/manifest.json" {
+			t.Errorf("unexpected meta: %+v", record.Meta)
+		}
+		if cache.setKey != expectedCacheKey {
+			t.Errorf("expected cache key %q, got %q", expectedCacheKey, cache.setKey)
+		}
+		if cache.setTTL != 300*time.Second {
+			t.Errorf("expected TTL 300s from response, got %v", cache.setTTL)
+		}
+	})
+
+	t.Run("nil cache — no cache operations", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(dediNodeResponse(300))
+		}))
+		defer server.Close()
+
+		client, closer, err := New(ctx, nil, &Config{URL: server.URL})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer closer()
+
+		record, err := client.LookupNode(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("LookupNode() unexpected error: %v", err)
+		}
+		if record.URL != "http://bpp.example.com" {
+			t.Errorf("unexpected subscriber URL: %s", record.URL)
+		}
+	})
+
+	t.Run("cache set error does not fail lookup", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(dediNodeResponse(300))
+		}))
+		defer server.Close()
+
+		cache := &mockCache{setErr: errors.New("redis down")}
+		client, closer, err := New(ctx, cache, &Config{URL: server.URL})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer closer()
+
+		record, err := client.LookupNode(ctx, nodeID)
+		if err != nil {
+			t.Fatalf("LookupNode() must not fail when cache.Set errors, got: %v", err)
+		}
+		if record.URL != "http://bpp.example.com" {
+			t.Errorf("unexpected subscriber URL: %s", record.URL)
+		}
+	})
+}

@@ -55,6 +55,10 @@ func (m *mockRegistry) LookupRegistry(ctx context.Context, namespaceIdentifier, 
 	return m.meta, m.err
 }
 
+func (m *mockRegistry) LookupNode(ctx context.Context, nodeID string) (*model.SubscriberRecord, error) {
+	return nil, nil
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
