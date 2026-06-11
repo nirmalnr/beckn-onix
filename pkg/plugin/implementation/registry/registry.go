@@ -35,6 +35,7 @@ type RegistryClient struct {
 	client   *retryablehttp.Client
 	cache    definition.Cache
 	cacheTTL time.Duration
+	tracer   trace.Tracer
 }
 
 // validate checks if the provided registry configuration is valid.
@@ -79,6 +80,7 @@ func New(ctx context.Context, cache definition.Cache, cfg *Config) (*RegistryCli
 		client:   rc,
 		cache:    cache,
 		cacheTTL: ttl,
+		tracer:   otel.Tracer(telemetry.ScopeName, trace.WithInstrumentationVersion(telemetry.ScopeVersion)),
 	}
 
 	// Cleanup function
@@ -127,25 +129,34 @@ func (c *RegistryClient) Subscribe(ctx context.Context, subscription *model.Subs
 	return nil
 }
 
+// lookupFromCache tries to return results from the cache for the given key.
+// Returns nil, false on any miss or unmarshal error.
+func (c *RegistryClient) lookupFromCache(ctx context.Context, cacheKey string) ([]model.Subscription, bool) {
+	cacheCtx, span := c.tracer.Start(ctx, "cache lookup")
+	defer span.End()
+
+	cached, err := c.cache.Get(cacheCtx, cacheKey)
+	if err != nil {
+		return nil, false
+	}
+	var results []model.Subscription
+	if err := json.Unmarshal([]byte(cached), &results); err != nil {
+		return nil, false
+	}
+	log.Debugf(ctx, "Registry lookup cache hit for key: %s", cacheKey)
+	return results, true
+}
+
 // Lookup calls the /lookup endpoint with retry and returns a slice of Subscription.
 // Results are cached using the subscriber ID and key ID as the cache key.
 // On a cache hit the network call is skipped entirely.
 func (c *RegistryClient) Lookup(ctx context.Context, subscription *model.Subscription) ([]model.Subscription, error) {
 	cacheKey := fmt.Sprintf("lookup_%s_%s", subscription.SubscriberID, subscription.KeyID)
-	tracer := otel.Tracer(telemetry.ScopeName, trace.WithInstrumentationVersion(telemetry.ScopeVersion))
 
 	if c.cache != nil {
-		cacheCtx, cacheSpan := tracer.Start(ctx, "cache lookup")
-		cached, err := c.cache.Get(cacheCtx, cacheKey)
-		if err == nil {
-			var results []model.Subscription
-			if err := json.Unmarshal([]byte(cached), &results); err == nil {
-				log.Debugf(ctx, "Registry lookup cache hit for key: %s", cacheKey)
-				cacheSpan.End()
-				return results, nil
-			}
+		if results, ok := c.lookupFromCache(ctx, cacheKey); ok {
+			return results, nil
 		}
-		cacheSpan.End()
 	}
 
 	lookupURL := fmt.Sprintf("%s/lookup", c.config.URL)
@@ -161,30 +172,27 @@ func (c *RegistryClient) Lookup(ctx context.Context, subscription *model.Subscri
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	httpCtx, httpSpan := tracer.Start(ctx, "http lookup")
+	httpCtx, httpSpan := c.tracer.Start(ctx, "http lookup")
+	defer httpSpan.End()
 	req = req.WithContext(httpCtx)
 
 	log.Debugf(ctx, "Making lookup request to: %s", lookupURL)
 	resp, err := c.client.Do(req)
 	if err != nil {
-		httpSpan.End()
 		return nil, fmt.Errorf("failed to send lookup request with retry: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		httpSpan.End()
 		log.Errorf(ctx, nil, "Lookup request failed with status: %s, response: %s", resp.Status, string(body))
 		return nil, fmt.Errorf("lookup request failed with status: %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		httpSpan.End()
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	httpSpan.End()
 
 	var results []model.Subscription
 	if err := json.Unmarshal(body, &results); err != nil {

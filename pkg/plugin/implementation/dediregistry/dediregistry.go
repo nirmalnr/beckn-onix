@@ -40,6 +40,7 @@ type DeDiRegistryClient struct {
 	client   *retryablehttp.Client
 	cache    definition.Cache
 	cacheTTL time.Duration
+	tracer   trace.Tracer
 }
 
 // validate checks if the provided DeDi registry configuration is valid.
@@ -89,6 +90,7 @@ func New(ctx context.Context, cache definition.Cache, cfg *Config) (*DeDiRegistr
 		client:   retryClient,
 		cache:    cache,
 		cacheTTL: ttl,
+		tracer:   otel.Tracer(telemetry.ScopeName, trace.WithInstrumentationVersion(telemetry.ScopeVersion)),
 	}
 
 	// Cleanup function
@@ -145,6 +147,24 @@ func (c *DeDiRegistryClient) fetchDeDiData(ctx context.Context, url, operation s
 	return data, nil
 }
 
+// lookupFromCache tries to return results from the cache for the given key.
+// Returns nil, false on any miss or unmarshal error.
+func (c *DeDiRegistryClient) lookupFromCache(ctx context.Context, cacheKey string) ([]model.Subscription, bool) {
+	cacheCtx, span := c.tracer.Start(ctx, "cache lookup")
+	defer span.End()
+
+	cached, err := c.cache.Get(cacheCtx, cacheKey)
+	if err != nil {
+		return nil, false
+	}
+	var results []model.Subscription
+	if err := json.Unmarshal([]byte(cached), &results); err != nil {
+		return nil, false
+	}
+	log.Debugf(ctx, "DeDi registry lookup cache hit for key: %s", cacheKey)
+	return results, true
+}
+
 // Lookup implements RegistryLookup interface - calls the DeDi wrapper lookup endpoint and returns Subscription.
 // Results are cached using the subscriber ID and key ID as the cache key.
 // On a cache hit the network call is skipped entirely.
@@ -161,27 +181,18 @@ func (c *DeDiRegistryClient) Lookup(ctx context.Context, req *model.Subscription
 	}
 
 	cacheKey := fmt.Sprintf("lookup_%s_%s", subscriberID, keyID)
-	tracer := otel.Tracer(telemetry.ScopeName, trace.WithInstrumentationVersion(telemetry.ScopeVersion))
 
 	if c.cache != nil {
-		cacheCtx, cacheSpan := tracer.Start(ctx, "cache lookup")
-		cached, err := c.cache.Get(cacheCtx, cacheKey)
-		if err == nil {
-			var results []model.Subscription
-			if err := json.Unmarshal([]byte(cached), &results); err == nil {
-				log.Debugf(ctx, "DeDi registry lookup cache hit for key: %s", cacheKey)
-				cacheSpan.End()
-				return results, nil
-			}
+		if results, ok := c.lookupFromCache(ctx, cacheKey); ok {
+			return results, nil
 		}
-		cacheSpan.End()
 	}
 
 	lookupURL := fmt.Sprintf("%s/lookup/%s/%s/%s", c.config.URL, subscriberID, dediAllRegistriesWildcard, keyID)
 
-	httpCtx, httpSpan := tracer.Start(ctx, "http lookup")
+	httpCtx, httpSpan := c.tracer.Start(ctx, "http lookup")
+	defer httpSpan.End()
 	data, err := c.fetchDeDiData(httpCtx, lookupURL, "record lookup")
-	httpSpan.End()
 	if err != nil {
 		return nil, err
 	}
